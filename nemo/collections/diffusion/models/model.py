@@ -58,12 +58,12 @@ def dit_data_step(module, dataloader_iter):
         'self_attention': PackedSeqParams(
             cu_seqlens_q=cu_seqlens,
             cu_seqlens_kv=cu_seqlens,
-            qkv_format='sbhd',
+            qkv_format=module.qkv_format,
         ),
         'cross_attention': PackedSeqParams(
             cu_seqlens_q=cu_seqlens,
             cu_seqlens_kv=cu_seqlens_kv,
-            qkv_format='sbhd',
+            qkv_format=module.qkv_format,
         ),
     }
 
@@ -77,9 +77,7 @@ def get_batch_on_this_cp_rank(data: Dict):
     cp_size = mpu.get_context_parallel_world_size()
     cp_rank = mpu.get_context_parallel_rank()
 
-    t = 16
     if cp_size > 1:
-        assert t % cp_size == 0, "t must divisibly by cp_size"
         num_valid_tokens_in_ub = None
         if 'loss_mask' in data and data['loss_mask'] is not None:
             num_valid_tokens_in_ub = data['loss_mask'].sum()
@@ -88,16 +86,17 @@ def get_batch_on_this_cp_rank(data: Dict):
             if (value is not None) and (key in ['video', 'video_latent', 'noise_latent', 'pos_ids']):
                 if len(value.shape) > 5:
                     value = value.squeeze(0)
-                B, C, T, H, W = value.shape
+                if len(value.shape) == 5:
+                    B, C, T, H, W = value.shape
+                    data[key] = value.view(B, C, cp_size, T // cp_size, H, W)[:, :, cp_rank, ...].contiguous()
+                else:
+                    B, S, D = value.shape
+                    data[key] = value.view(B, cp_size, S // cp_size, D)[:, cp_rank, ...].contiguous()
                 # TODO: sequence packing
-                data[key] = value.view(B, C, cp_size, T // cp_size, H, W)[:, :, cp_rank, ...].contiguous()
         loss_mask = data["loss_mask"]
-        data["loss_mask"] = loss_mask.view(loss_mask.shape[0], cp_size, loss_mask.shape[1] // cp_size)[
-            :, cp_rank, ...
-        ].contiguous()
+        data["loss_mask"] = loss_mask.view(loss_mask.shape[0], cp_size, loss_mask.shape[1] // cp_size)[:, cp_rank, ...].contiguous()
         data['num_valid_tokens_in_ub'] = num_valid_tokens_in_ub
     return data
-
 
 @dataclass
 class DiTConfig(TransformerConfig, io.IOMixin):
@@ -141,6 +140,12 @@ class DiTConfig(TransformerConfig, io.IOMixin):
 
     data_step_fn = dit_data_step
     forward_step_fn = dit_forward_step
+
+    replicated_t_embedder = True
+
+    seq_length: int = 2048
+
+    qkv_format: str = 'sbhd'
 
     @override
     def configure_model(self, tokenizer=None) -> DiTCrossAttentionModel:
@@ -191,13 +196,11 @@ class DiTXLConfig(DiTConfig):
     hidden_size: int = 1152
     num_attention_heads: int = 16
 
-
 @dataclass
 class DiT7BConfig(DiTConfig):
     num_layers: int = 32
     hidden_size: int = 3072
     num_attention_heads: int = 24
-
 
 @dataclass
 class DiTLlama30BConfig(DiTConfig):
@@ -233,6 +236,24 @@ class DiTLlama5BConfig(DiTLlama30BConfig):
     ffn_hidden_size: int = 8192
     num_attention_heads: int = 24
 
+@dataclass
+class DiTLlama1BConfig(DiTLlama30BConfig):
+    num_layers: int = 16
+    hidden_size: int = 2048
+    ffn_hidden_size: int = 8192
+    num_attention_heads: int = 32
+
+@dataclass
+class ECDiTLlama1BConfig(DiTLlama1BConfig):
+    moe_router_load_balancing_type: str = 'expert_choice'
+    moe_token_dispatcher_type: str = 'alltoall'
+    moe_grouped_gemm: bool = True
+    moe_expert_capacity_factor: float = 8
+    moe_pad_expert_input_to_capacity: bool = True
+    moe_router_topk: int = 1
+    num_moe_experts: int = 64
+    ffn_hidden_size: int = 1024
+
 
 class DiTModel(GPTModel):
     def __init__(
@@ -255,6 +276,9 @@ class DiTModel(GPTModel):
         self.seed = 42
 
         self.vae = None
+
+    def load_state_dict(self, state_dict, strict=False):
+        self.module.load_state_dict(state_dict, strict=False)
 
     def data_step(self, dataloader_iter) -> Dict[str, Any]:
         return self.config.data_step_fn(dataloader_iter)
@@ -299,12 +323,11 @@ class DiTModel(GPTModel):
         )
 
         # TODO visualize more than 1 sample
-        sample = sample[0, None]
-        C, T, H, W = batch['latent_shape'][0]
         seq_len_q = batch['seq_len_q'][0]
+        C, T, H, W = batch['latent_shape'][0]
 
         sample = rearrange(
-            sample[:, :seq_len_q],
+            sample[0, None, :seq_len_q],
             'B (T H W) (ph pw pt C) -> B C (T pt) (H ph) (W pw)',
             ph=self.config.patch_spatial,
             pw=self.config.patch_spatial,
@@ -318,13 +341,7 @@ class DiTModel(GPTModel):
 
         video = (video * 255).to(torch.uint8).cpu().numpy().astype(np.uint8)
 
-        T = video.shape[2]
-        if T == 1:
-            image = rearrange(video, 'b c t h w -> (b t h) w c')
-            result = image
-        else:
-            # result = wandb.Video(video, fps=float(batch['fps'])) # (batch, time, channel, height width)
-            result = video
+        result = rearrange(video, 'b c t h w -> (b t) c h w')
 
         # wandb is on the last rank for megatron, first rank for nemo
         wandb_rank = 0
@@ -340,11 +357,12 @@ class DiTModel(GPTModel):
             if gather_list is not None:
                 videos = []
                 for video in gather_list:
-                    if len(video.shape) == 3:
-                        videos.append(wandb.Image(video))
-                    else:
-                        videos.append(wandb.Video(video, fps=30))
-                wandb.log({'prediction': videos}, step=self.global_step)
+                    try:
+                        videos.append(wandb.Video(video, fps=24, format='mp4'))
+                    except Exception as e:
+                        warnings.warn(f'Error saving video as mp4: {e}')
+                        videos.append(wandb.Video(video, fps=24))
+                wandb.log({'prediction': videos})
 
         return None
 

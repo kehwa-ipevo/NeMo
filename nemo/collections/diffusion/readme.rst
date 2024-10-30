@@ -4,7 +4,7 @@ Diffusion Training Framework
 Overview
 --------
 
-The NeMo Diffusion Training Framework provides a scalable training platform for diffusion models with transformer backbones.  Our new features streamline the training process, allowing developers to efficiently train state-of-the-art models with ease. 
+The NeMo Diffusion Training Framework provides a scalable training platform for image/video diffusion models with transformer backbones.  Our new features streamline the training process, allowing developers to efficiently train state-of-the-art models with ease. 
 
 
 Some of the features we currently support include:
@@ -17,21 +17,23 @@ Some of the features we currently support include:
 Features Status
 ---------------
 
-We support image diffusion training. Video training incoming.
-
+We support image/video diffusion training with all parallelism strategies. 
 
 +---------------------------+------------------+
 | Parallelism               | Status           |
 +===========================+==================+
 | FSDP                      | ✅ Supported     |
 +---------------------------+------------------+
+| CP+TP+SP+FSDP             | ✅ Supported     |
++---------------------------+------------------+
 | CP+TP+SP+distopt          | ✅ Supported     |
 +---------------------------+------------------+
 | CP+TP+SP+PP+distopt       | ✅ Supported     |
 +---------------------------+------------------+
-| CP+TP+SP+FSDP             | 🕒 Coming Soon   |
+| CP+TP+SP+PP+distopt+EP    | ✅ Supported     |
 +---------------------------+------------------+
-
+| CP+TP+SP+FSDP+EP          | ✅ Supported     |
++---------------------------+------------------+
 
 **Legend:**
 - **FSDP**: Fully Sharded Data Parallelism
@@ -39,17 +41,21 @@ We support image diffusion training. Video training incoming.
 - **TP**: Tensor Parallelism
 - **SP**: Sequence Parallelism
 - **PP**: Pipeline Parallelism
+- **EP**: Expert Parallelism
 - **distop**: mcore distributed optmizer
 
-+--------------+-------------------+-----------------+
-| Model Size   | Modality          | Status          |
-+==============+===================+=================+
-| DiT 30B+     | 256px image       | ✅ Supported    |
-+--------------+-------------------+-----------------+
-| DiT 30B+     | 256px image+video | 🕒 Coming Soon  |
-+--------------+-------------------+-----------------+
-| DiT 30B+     | 768px image+video | 🕒 Coming Soon  |
-+--------------+-------------------+-----------------+
+training stages:
+
++---------------+----------------------+-----------------+-----------------+
+| Model Size    | Modality             | sequence length | Status          |
++===============+======================+=================+=================+
+| DiT 5B, 30B+  | 256px image          | 256             | ✅ Supported    |
++---------------+----------------------+-----------------+-----------------+
+| DiT 5B, 30B+  | 256px image+video    | 8k              | ✅ Supported    |
++---------------+----------------------+-----------------+-----------------+
+| DiT 5B, 30B+  | 768px image+video    | 74k+            | ✅ Supported    |
++---------------+----------------------+-----------------+-----------------+
+
 
 
 Energon Dataloader for Webscale Dataloading
@@ -71,7 +77,7 @@ Parallel Configuration
 Energon's architecture allows it to efficiently distribute data across multiple processing units, ensuring that each GPU or node receives a balanced workload. This parallelization not only increases the overall throughput of data processing but also helps in maintaining high utilization of available computational resources.
 
 
-Mixed Image-Video Training (comming soon)
+Mixed Image-Video Training
 ------------------------------
 
 Our dataloader provides support for mixed image-video training by using the NeMo packed sequence feature to pack together images and videos of varying length into the same microbatch. The sequence packing mechanism uses the THD attention kernel, which allows us to increase the model FLOPs utilization (MFU) and efficiently process data with varying length.
@@ -171,7 +177,15 @@ The following is a sample command to prepare prepare webdataset into energon dat
 training
 --------------------------
 
-To launch training on one node
+To launch training, you need either a local machine with GPUs or a cluster with Slurm.
+
+To launch training on a single node, you need docker permission. 
+
+.. code-block:: bash
+   git clone git@github.com:NVIDIA/NeMo.git
+
+   torchrun --nproc-per-node 8 nemo/collections/diffusion/train.py --yes --factory pretrain_xl
+
 
 .. code-block:: bash
 

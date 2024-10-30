@@ -24,17 +24,23 @@ from pytorch_lightning.loggers import WandbLogger
 from nemo import lightning as nl
 from nemo.collections import llm
 from nemo.collections.diffusion.data.diffusion_energon_datamodule import DiffusionDataModule
+from nemo.collections.diffusion.data.diffusion_fake_datamodule import VideoLatentFakeDataModule
 from nemo.collections.diffusion.data.diffusion_taskencoder import BasicDiffusionTaskEncoder
 from nemo.collections.diffusion.models.model import (
     DiT7BConfig,
     DiTConfig,
     DiTLConfig,
+    DiTLlama1BConfig,
+    ECDiTLlama1BConfig,
     DiTLlama5BConfig,
     DiTLlama30BConfig,
     DiTModel,
     DiTXLConfig,
 )
+from nemo.collections.multimodal.data.energon.base import SimpleMultiModalDataModule
 from nemo.lightning.pytorch.callbacks import ModelCheckpoint, PreemptionCallback
+from nemo.lightning.pytorch.callbacks.megatron_comm_overlap import MegatronCommOverlapCallback
+from nemo.utils.exp_manager import TimingCallback
 from nemo.lightning.pytorch.callbacks.model_transform import ModelTransform
 from nemo.lightning.pytorch.strategies.utils import RestoreConfig
 
@@ -50,6 +56,30 @@ def multimodal_datamodule() -> pl.LightningDataModule:
     )
     return data_module
 
+@run.cli.factory
+@run.autoconvert
+def simple_datamodule() -> pl.LightningDataModule:
+    data_module = SimpleMultiModalDataModule(
+        seq_length=2048,
+        micro_batch_size=1,
+        global_batch_size=32,
+        num_workers=16,
+        tokenizer=None,
+        image_processor=None,
+        task_encoder=run.Config(BasicDiffusionTaskEncoder, seq_length=2048),
+        )
+    return data_module
+    
+@run.cli.factory
+@run.autoconvert
+def multimodal_fake_datamodule() -> pl.LightningDataModule:
+    data_module = VideoLatentFakeDataModule(
+        seq_length=None, #Set None to dectect the sequence length automatically.
+        task_encoder=run.Config(BasicDiffusionTaskEncoder, seq_length=2048),
+        micro_batch_size=1,
+        global_batch_size=32,
+    )
+    return data_module
 
 @run.cli.factory
 @run.autoconvert
@@ -85,6 +115,8 @@ def pretrain() -> run.Partial:
                     DistributedDataParallelConfig,
                     check_for_nan_in_grad=True,
                     grad_reduce_in_fp32=True,
+                    overlap_grad_reduce=True,
+                    overlap_param_gather=True,
                 ),
             ),
             plugins=nl.MegatronMixedPrecision(precision="bf16-mixed"),
@@ -96,12 +128,18 @@ def pretrain() -> run.Partial:
             callbacks=[
                 run.Config(
                     ModelCheckpoint,
-                    monitor='reduced_train_loss',
-                    filename='{epoch}-{step}',
+                    monitor='global_step',
+                    filename='{global_step}',
                     every_n_train_steps=1000,
-                    save_top_k=-1,
+                    save_top_k=3,
+                    mode='max',
                 ),
                 run.Config(PreemptionCallback),
+                run.Config(TimingCallback),
+                run.Config(
+                    MegatronCommOverlapCallback,
+                    tp_comm_overlap=False,
+                ),             
             ],
         ),
         log=nl.NeMoLogger(wandb=(WandbLogger() if "WANDB_API_KEY" in os.environ else None)),
@@ -140,6 +178,32 @@ def pretrain_l() -> run.Partial:
     recipe.model.config = run.Config(DiTLConfig)
     return recipe
 
+@run.cli.factory(target=llm.train)
+def train_mock() -> run.Partial:
+    recipe = pretrain()
+    recipe.model.config = run.Config(DiTLlama5BConfig, max_frames=1)
+    recipe.data = multimodal_fake_datamodule()
+    recipe.model.config.num_layers = 16
+    # recipe.model.config.max_frames = 1 
+    recipe.data.seq_length = 73728
+    recipe.data.task_encoder.seq_length = 73728
+    recipe.trainer.strategy.tensor_model_parallel_size = 4
+    recipe.trainer.strategy.sequence_parallel = True
+    recipe.trainer.strategy.context_parallel_size = 2
+    recipe.data.micro_batch_size = 1
+    recipe.data.global_batch_size = 1
+    recipe.trainer.limit_val_batches = 0
+    recipe.trainer.val_check_interval = 1.0
+    recipe.data.model_config = recipe.model.config
+    recipe.log.log_dir = 'nemo_experiments/tmp2'
+
+    recipe.trainer.strategy.ddp.with_megatron_fsdp_code_path = True
+    recipe.trainer.strategy.ddp.data_parallel_sharding_strategy = 'MODEL_AND_OPTIMIZER_STATES'
+    recipe.trainer.strategy.ddp.overlap_param_gather = True
+    recipe.trainer.strategy.ddp.overlap_grad_reduce = True
+    recipe.model.config.use_cpu_initialization = True
+
+    return recipe
 
 @run.cli.factory(target=llm.train)
 def pretrain_7b() -> run.Partial:
@@ -160,6 +224,59 @@ def pretrain_7b() -> run.Partial:
 
     return recipe
 
+@run.cli.factory(target=llm.train)
+def pretrain_7b_pack() -> run.Partial:
+    recipe = pretrain_7b()
+    recipe.data.global_batch_size = 4608 // 9
+    recipe.data.micro_batch_size = 1
+    recipe.data.num_workers = 15
+    recipe.data.use_train_split_for_val = True
+    recipe.data.seq_length = 256 * 9
+    recipe.data.packing_buffer_size = 1000
+    recipe.data.task_encoder.seq_length = None
+    recipe.data.task_encoder.max_seq_length = recipe.data.seq_length
+    recipe.model.config.qkv_format = 'thd'
+    # recipe.model.config.num_layers = 1
+    return recipe
+
+@run.cli.factory(target=llm.train)
+def pretrain_7b_256p_joint() -> run.Partial:
+    recipe = pretrain_7b()
+    recipe.data.global_batch_size = 256 #768
+    recipe.data.micro_batch_size = 1
+    recipe.data.seq_length = 8192
+    recipe.data.task_encoder.seq_length = 8192
+    recipe.model.config.seq_length = 8192
+
+    recipe.optim.config.lr = 6e-5
+    recipe.trainer.strategy.tensor_model_parallel_size = 2
+    recipe.trainer.strategy.sequence_parallel = True
+    # recipe.trainer.strategy.ddp.overlap_param_gather = True
+    recipe.trainer.strategy.ddp.overlap_grad_reduce = True  
+    # recipe.trainer.strategy.context_parallel_size = 4
+    # recipe.trainer.callbacks.append(
+    #     run.Config(
+    #         MegatronCommOverlapCallback,
+    #         tp_comm_overlap=True,
+    #     )
+    # )
+
+    recipe.resume.restore_config = run.Config(RestoreConfig, path='nemo_experiments/dit7b/default/checkpoints/epoch=0-step=52579-last/weights', load_optim_state=True)
+    recipe.log.log_dir = 'nemo_experiments/pretrain_7b_256p_joint'
+    return recipe
+
+@run.cli.factory(target=llm.train)
+def pretrain_7b_256p_joint_pack() -> run.Partial:
+    recipe = pretrain_7b_256p_joint()
+    recipe.data.global_batch_size = 128
+    recipe.data.micro_batch_size = 1
+    recipe.data.num_workers = 10
+    recipe.data.seq_length = recipe.model.config.seq_length = recipe.data.task_encoder.max_seq_length = 10240
+    recipe.data.task_encoder.seq_length = None
+    recipe.data.packing_buffer_size = 1000
+    recipe.data.virtual_epoch_length = 0
+    recipe.model.config.qkv_format = 'thd'
+    return recipe
 
 @run.cli.factory(target=llm.train)
 def pretrain_ditllama5b() -> run.Partial:
@@ -169,14 +286,180 @@ def pretrain_ditllama5b() -> run.Partial:
     recipe.log.log_dir = 'nemo_experiments/ditllama5b'
     return recipe
 
-
 @run.cli.factory(target=llm.train)
 def pretrain_ditllama30b() -> run.Partial:
     recipe = pretrain_ditllama5b()
     recipe.model.config = run.Config(DiTLlama30BConfig)
     recipe.data.global_batch_size = 9216
     recipe.data.micro_batch_size = 6
+    recipe.data.task_encoder.aethetic_score = 4.0
+    recipe.data.seq_length = 256
+    recipe.data.task_encoder.seq_length = 256
+    recipe.data.virtual_epoch_length = 0
     recipe.log.log_dir = 'nemo_experiments/ditllama30b'
+
+    recipe.trainer.strategy.ddp.with_megatron_fsdp_code_path = True
+    recipe.trainer.strategy.ddp.data_parallel_sharding_strategy = 'MODEL_AND_OPTIMIZER_STATES'
+    recipe.trainer.strategy.ddp.overlap_param_gather = True
+    recipe.trainer.strategy.ddp.overlap_grad_reduce = True
+    recipe.model.config.use_cpu_initialization = True
+
+    return recipe
+
+@run.cli.factory(target=llm.train)
+def pretrain_ditllama30b_stage2_mock() -> run.Partial:
+    recipe = pretrain_ditllama5b()
+    recipe.model.config = run.Config(DiTLlama30BConfig)
+    recipe.data = multimodal_fake_datamodule()
+    recipe.data.model_config = recipe.model.config
+    recipe.data.seq_length = 8192
+    recipe.data.task_encoder.seq_length = 8192
+    recipe.data.global_batch_size = 256
+    recipe.data.micro_batch_size = 1
+    recipe.trainer.strategy.tensor_model_parallel_size = 2
+    recipe.trainer.strategy.context_parallel_size = 4
+    recipe.trainer.strategy.sequence_parallel = True
+    recipe.trainer.limit_val_batches = 0
+    recipe.trainer.val_check_interval = 1.0
+    recipe.data.model_config = recipe.model.config
+    recipe.log.log_dir = 'nemo_experiments/ditllama30b_stage2_mock_perf_v1'
+
+    recipe.trainer.strategy.ddp.with_megatron_fsdp_code_path = True
+    recipe.trainer.strategy.ddp.data_parallel_sharding_strategy = 'MODEL_AND_OPTIMIZER_STATES'
+    recipe.trainer.strategy.ddp.overlap_param_gather = True
+    recipe.trainer.strategy.ddp.overlap_grad_reduce = True
+    recipe.model.config.use_cpu_initialization = True
+
+    return recipe
+
+@run.cli.factory(target=llm.train)
+def pretrain_ditllama30b_stage3_mock() -> run.Partial:
+    recipe = pretrain_ditllama5b()
+    recipe.model.config = run.Config(DiTLlama30BConfig)
+    recipe.data = multimodal_fake_datamodule()
+    recipe.data.model_config = recipe.model.config
+    recipe.data.seq_length = 73728
+    recipe.data.task_encoder.seq_length = 73728
+    recipe.data.global_batch_size = 256
+    recipe.data.micro_batch_size = 1
+    recipe.trainer.strategy.tensor_model_parallel_size = 2
+    recipe.trainer.strategy.context_parallel_size = 8
+    recipe.trainer.strategy.sequence_parallel = True
+    recipe.trainer.limit_val_batches = 0
+    recipe.trainer.val_check_interval = 1.0
+    recipe.data.model_config = recipe.model.config
+    recipe.log.log_dir = 'nemo_experiments/ditllama30b_stage3_mock_perf_v5'
+
+    recipe.trainer.strategy.ddp.with_megatron_fsdp_code_path = True
+    recipe.trainer.strategy.ddp.data_parallel_sharding_strategy = 'MODEL_AND_OPTIMIZER_STATES'
+    recipe.trainer.strategy.ddp.overlap_param_gather = True
+    recipe.trainer.strategy.ddp.overlap_grad_reduce = True
+    recipe.model.config.use_cpu_initialization = True
+
+    return recipe
+
+@run.cli.factory(target=llm.train)
+def pretrain_ditllama5b_stage3_mock_with_pp() -> run.Partial:
+    recipe = pretrain_ditllama5b()
+    recipe.model.config.num_layers=2
+    recipe.data = multimodal_fake_datamodule()
+    recipe.data.model_config = recipe.model.config
+    recipe.data.seq_length = 8192
+    recipe.data.task_encoder.seq_length = 8192
+    recipe.data.global_batch_size = 1
+    recipe.data.micro_batch_size = 1
+    recipe.trainer.strategy.tensor_model_parallel_size = 2
+    recipe.trainer.strategy.pipeline_model_parallel_size = 2
+    recipe.trainer.strategy.context_parallel_size = 2
+    recipe.trainer.strategy.sequence_parallel = True
+    recipe.trainer.limit_val_batches = 0
+    recipe.trainer.val_check_interval = 1.0
+    recipe.data.model_config = recipe.model.config
+    recipe.log.log_dir = 'nemo_experiments/ditllama30b_stage5_mock_with_pp_perf_test'
+
+    # recipe.trainer.strategy.ddp.with_megatron_fsdp_code_path = True
+    # recipe.trainer.strategy.ddp.data_parallel_sharding_strategy = 'MODEL_AND_OPTIMIZER_STATES'
+    # recipe.trainer.strategy.ddp.overlap_param_gather = True
+    # recipe.trainer.strategy.ddp.overlap_grad_reduce = True
+    # recipe.model.config.use_cpu_initialization = True
+
+    return recipe
+
+@run.cli.factory(target=llm.train)
+def pretrain_ditllama30b_stage3_mock_with_pp() -> run.Partial:
+    recipe = pretrain_ditllama5b()
+    recipe.model.config = run.Config(DiTLlama30BConfig)
+    recipe.data = multimodal_fake_datamodule()
+    recipe.data.model_config = recipe.model.config
+    recipe.data.seq_length = 73728
+    recipe.data.task_encoder.seq_length = 73728
+    recipe.data.global_batch_size = 256
+    recipe.data.micro_batch_size = 1
+    recipe.trainer.strategy.tensor_model_parallel_size = 4
+    recipe.trainer.strategy.pipeline_model_parallel_size = 4
+    recipe.trainer.strategy.context_parallel_size = 8
+    recipe.trainer.strategy.sequence_parallel = True
+    recipe.trainer.limit_val_batches = 0
+    recipe.trainer.val_check_interval = 1.0
+    recipe.data.model_config = recipe.model.config
+    recipe.log.log_dir = 'nemo_experiments/ditllama30b_stage5_mock_with_pp_perf_v2'
+
+    # recipe.trainer.strategy.ddp.with_megatron_fsdp_code_path = True
+    # recipe.trainer.strategy.ddp.data_parallel_sharding_strategy = 'MODEL_AND_OPTIMIZER_STATES'
+    # recipe.trainer.strategy.ddp.overlap_param_gather = True
+    # recipe.trainer.strategy.ddp.overlap_grad_reduce = True
+    # recipe.model.config.use_cpu_initialization = True
+
+    return recipe
+
+@run.cli.factory(target=llm.train)
+def pretrain_ditllama1b() -> run.Partial:
+    recipe = pretrain_ditllama5b()
+    recipe.data.task_encoder.aethetic_score = 4.0
+    recipe.data.seq_length = 256
+    recipe.data.task_encoder.seq_length = 256
+    recipe.model.config.seq_length = 256
+    recipe.data.global_batch_size = 1536
+    recipe.data.micro_batch_size = 96
+    recipe.trainer.strategy.ddp.overlap_grad_reduce = True  
+    recipe.model.config = run.Config(DiTLlama1BConfig)
+    recipe.log.log_dir = 'nemo_experiments/ditllama1b'
+    recipe.trainer.val_check_interval = 3000
+    recipe.trainer.callbacks[0].every_n_train_steps = 3000
+    recipe.trainer.callbacks[0].monitor = 'global_step'
+    recipe.trainer.callbacks[0].save_top_k = 3
+    recipe.trainer.callbacks[0].mode = 'max'
+    return recipe
+
+@run.cli.factory(target=llm.train)
+def pretrain_ditllama3b() -> run.Partial:
+    recipe = pretrain_ditllama1b()
+    recipe.data.micro_batch_size = 48
+    recipe.model.config = run.Config(DiTLlama1BConfig, 
+                                     hidden_size=3072,
+                                     num_layers=28,
+                                     num_attention_heads=24,
+                                     ffn_hidden_size=8192,)
+    recipe.log.log_dir = 'nemo_experiments/ditllama3b'
+    
+    return recipe
+
+@run.cli.factory(target=llm.train)
+def pretrain_ecditllama1b() -> run.Partial:
+    recipe = pretrain_ditllama1b()
+    recipe.data.task_encoder.aethetic_score = 5.0
+    recipe.data.micro_batch_size = 72
+    recipe.data.global_batch_size = 2304
+    recipe.model.config = run.Config(ECDiTLlama1BConfig)
+    recipe.log.log_dir = 'nemo_experiments/ecditllama1b'
+    recipe.trainer.val_check_interval = 3000
+
+    recipe.trainer.strategy.ddp.with_megatron_fsdp_code_path = True
+    recipe.trainer.strategy.ddp.data_parallel_sharding_strategy = 'MODEL_AND_OPTIMIZER_STATES'
+    recipe.trainer.strategy.ddp.overlap_param_gather = True
+    recipe.trainer.strategy.ddp.overlap_grad_reduce = True
+    recipe.model.config.use_cpu_initialization = True
+
     return recipe
 
 
@@ -198,4 +481,12 @@ def dreambooth() -> run.Partial:
 
 
 if __name__ == "__main__":
+    OOM_DEBUG = False
+    if OOM_DEBUG:
+        torch.cuda.memory._record_memory_history(True,
+            # keep 100,000 alloc/free events from before the snapshot
+            trace_alloc_max_entries=100000,
+
+            # record stack information for the trace events
+            trace_alloc_record_context=True)
     run.cli.main(llm.train, default_factory=dreambooth)
