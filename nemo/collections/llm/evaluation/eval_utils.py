@@ -12,28 +12,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import time
-import requests
-from requests.exceptions import RequestException
-import subprocess
 import os
+import subprocess
+import time
 from pathlib import Path
 
+import requests
 import torch
 import torch.nn.functional as F
+from lm_eval.api.instance import Instance
+from lm_eval.api.model import LM
+from requests.exceptions import RequestException
 
 from nemo.collections.common.tokenizers.huggingface.auto_tokenizer import AutoTokenizer
 from nemo.collections.common.tokenizers.sentencepiece_tokenizer import SentencePieceTokenizer
 from nemo.utils import logging
 
-from lm_eval.api.instance import Instance
-from lm_eval.api.model import LM
 
 class NeMoFWLMEval(LM):
     """
     NeMoFWLMEval is a wrapper class subclassing lm_eval.api.model.LM class, that defines how lm_eval interfaces with our model deployed on PyTriton server.
     Created based on: https://github.com/EleutherAI/lm-evaluation-harness/blob/v0.4.4/docs/model_guide.md
     """
+
     def __init__(self, model_name, api_url, tokenizer, max_tokens_to_generate, temperature, top_p, top_k, add_bos):
         self.model_name = model_name
         self.api_url = api_url
@@ -93,11 +94,12 @@ class NeMoFWLMEval(LM):
             # get encoded tokens of continuation
             continuation_enc = self.tokenizer.tokenizer.encode(continuation, **special_tokens_kwargs)
             # for SentencePeice consider the encoded tokens from the 2nd token since first encoded token is space.
-            if self.tokenizer_type(self.tokenizer) == "SentencePieceTokenizer": continuation_enc = continuation_enc[1:]
+            if self.tokenizer_type(self.tokenizer) == "SentencePieceTokenizer":
+                continuation_enc = continuation_enc[1:]
             num_cont_tokens = len(continuation_enc)
             # Update self.max_tokens_to_generate with number of continuation tokens (or output tokens) in the request
             self.max_tokens_to_generate = num_cont_tokens
-            # Create payload to query the model deployed on PyTriton server 
+            # Create payload to query the model deployed on PyTriton server
             payload = {
                 "model": self.model_name,
                 "prompt": context,
@@ -117,9 +119,7 @@ class NeMoFWLMEval(LM):
             # Check if all greedy_tokens match the the actual continuation tokens
             is_greedy = (greedy_tokens == cont_toks).all()
             # Get the logits corresponding to the actual continuation tokens
-            logits = torch.gather(multi_logits, 2, cont_toks.unsqueeze(-1)).squeeze(
-                    -1
-                )
+            logits = torch.gather(multi_logits, 2, cont_toks.unsqueeze(-1)).squeeze(-1)
             # result is tuple of logProb of generating the continuation token and is_greedy
             result = (float(logits.sum()), bool(is_greedy))
 
@@ -139,7 +139,7 @@ class NeMoFWLMEval(LM):
         for instance in inputs:
             # Access the 'arguments' attribute of the Instance which contains the input prompt string
             prompt = instance.arguments[0]
-            # Create payload to query the model deployed on PyTriton server 
+            # Create payload to query the model deployed on PyTriton server
             payload = {
                 "model": self.model_name,
                 "prompt": prompt,
@@ -154,6 +154,7 @@ class NeMoFWLMEval(LM):
             results.append(generated_text)
 
         return results
+
 
 def unset_environment_variables():
     """
@@ -178,6 +179,7 @@ def unset_environment_variables():
 
     logging.info("Variables unset successfully")
 
+
 def get_trtllm_deployable(
     nemo_checkpoint,
     model_type,
@@ -189,7 +191,7 @@ def get_trtllm_deployable(
     max_output_len,
     max_batch_size,
     dtype,
-    output_generation_logits
+    output_generation_logits,
 ):
     from nemo.export.tensorrt_llm import TensorRTLLM
 
@@ -232,12 +234,13 @@ def get_trtllm_deployable(
                 max_output_len=max_output_len,
                 max_batch_size=max_batch_size,
                 dtype=dtype,
-                gather_generation_logits=output_generation_logits
+                gather_generation_logits=output_generation_logits,
             )
         except Exception as error:
             raise RuntimeError("An error has occurred during the model export. Error message: " + str(error))
 
     return trt_llm_exporter
+
 
 def wait_for_rest_service(rest_url, max_retries=60, retry_interval=2):
     """
@@ -245,7 +248,7 @@ def wait_for_rest_service(rest_url, max_retries=60, retry_interval=2):
 
     Args:
     rest_url (str): URL of the REST service's health endpoint
-    max_retries (int): Maximum number of retry attempts. Defaul: 60. 
+    max_retries (int): Maximum number of retry attempts. Defaul: 60.
     retry_interval (int): Time to wait between retries in seconds. Default: 2.
 
     Returns:
